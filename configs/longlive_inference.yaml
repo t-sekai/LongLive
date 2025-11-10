@@ -13,8 +13,8 @@ model_kwargs:
 
 
 # inference
-data_path: longlive_models/prompts/vidprom_filtered_extended.txt
-output_folder: videos/long
+data_path: debug/vidprom_filtered_tiny.txt #vidprom_filtered_extended.txt
+output_folder: videos/tiny
 inference_iter: -1
 num_output_frames: 120
 use_ema: false
