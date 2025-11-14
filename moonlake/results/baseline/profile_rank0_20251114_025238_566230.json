@@ -1,0 +1,220 @@
+{
+  "init_time_ms": 10.454943656921387,
+  "init_percentage": 0.012693771409206767,
+  "diffusion_time_ms": 58915.8984375,
+  "diffusion_percentage": 71.532183402879,
+  "vae_time_ms": 23436.431640625,
+  "vae_percentage": 28.45512282571179,
+  "total_time_ms": 82362.78502178192,
+  "block_stats": [
+    {
+      "block_index": 0,
+      "time_ms": 2261.826904296875,
+      "percent_of_diffusion": 3.8390773361392396
+    },
+    {
+      "block_index": 1,
+      "time_ms": 1163.29248046875,
+      "percent_of_diffusion": 1.974496717049661
+    },
+    {
+      "block_index": 2,
+      "time_ms": 1299.236572265625,
+      "percent_of_diffusion": 2.205239344086214
+    },
+    {
+      "block_index": 3,
+      "time_ms": 1437.343505859375,
+      "percent_of_diffusion": 2.439653037599279
+    },
+    {
+      "block_index": 4,
+      "time_ms": 1450.1451416015625,
+      "percent_of_diffusion": 2.4613816984220755
+    },
+    {
+      "block_index": 5,
+      "time_ms": 1449.547119140625,
+      "percent_of_diffusion": 2.4603666541355627
+    },
+    {
+      "block_index": 6,
+      "time_ms": 1451.5035400390625,
+      "percent_of_diffusion": 2.463687355254146
+    },
+    {
+      "block_index": 7,
+      "time_ms": 1455.8775634765625,
+      "percent_of_diffusion": 2.4711115371023444
+    },
+    {
+      "block_index": 8,
+      "time_ms": 1455.22900390625,
+      "percent_of_diffusion": 2.470010714425422
+    },
+    {
+      "block_index": 9,
+      "time_ms": 1454.838134765625,
+      "percent_of_diffusion": 2.4693472786619166
+    },
+    {
+      "block_index": 10,
+      "time_ms": 1458.7379150390625,
+      "percent_of_diffusion": 2.475966511121852
+    },
+    {
+      "block_index": 11,
+      "time_ms": 1462.71044921875,
+      "percent_of_diffusion": 2.482709231312908
+    },
+    {
+      "block_index": 12,
+      "time_ms": 1460.789306640625,
+      "percent_of_diffusion": 2.4794484093122677
+    },
+    {
+      "block_index": 13,
+      "time_ms": 1458.1446533203125,
+      "percent_of_diffusion": 2.474959547408349
+    },
+    {
+      "block_index": 14,
+      "time_ms": 1460.2281494140625,
+      "percent_of_diffusion": 2.4784959376680344
+    },
+    {
+      "block_index": 15,
+      "time_ms": 1461.177490234375,
+      "percent_of_diffusion": 2.480107286803819
+    },
+    {
+      "block_index": 16,
+      "time_ms": 1459.973876953125,
+      "percent_of_diffusion": 2.4780643521916503
+    },
+    {
+      "block_index": 17,
+      "time_ms": 1458.5865478515625,
+      "percent_of_diffusion": 2.4757095903389827
+    },
+    {
+      "block_index": 18,
+      "time_ms": 1460.14990234375,
+      "percent_of_diffusion": 2.4783631261988255
+    },
+    {
+      "block_index": 19,
+      "time_ms": 1461.6363525390625,
+      "percent_of_diffusion": 2.480886129725436
+    },
+    {
+      "block_index": 20,
+      "time_ms": 1471.5858154296875,
+      "percent_of_diffusion": 2.4977736985387673
+    },
+    {
+      "block_index": 21,
+      "time_ms": 1467.440185546875,
+      "percent_of_diffusion": 2.4907371770008493
+    },
+    {
+      "block_index": 22,
+      "time_ms": 1470.9417724609375,
+      "percent_of_diffusion": 2.4966805420464953
+    },
+    {
+      "block_index": 23,
+      "time_ms": 1471.15380859375,
+      "percent_of_diffusion": 2.4970404383366915
+    },
+    {
+      "block_index": 24,
+      "time_ms": 1464.1083984375,
+      "percent_of_diffusion": 2.4850820190592127
+    },
+    {
+      "block_index": 25,
+      "time_ms": 1464.14404296875,
+      "percent_of_diffusion": 2.4851425197596946
+    },
+    {
+      "block_index": 26,
+      "time_ms": 1467.1162109375,
+      "percent_of_diffusion": 2.4901872836478374
+    },
+    {
+      "block_index": 27,
+      "time_ms": 1469.807861328125,
+      "percent_of_diffusion": 2.4947559153109538
+    },
+    {
+      "block_index": 28,
+      "time_ms": 1470.0804443359375,
+      "percent_of_diffusion": 2.495218579914298
+    },
+    {
+      "block_index": 29,
+      "time_ms": 1470.5029296875,
+      "percent_of_diffusion": 2.4959356789703544
+    },
+    {
+      "block_index": 30,
+      "time_ms": 1473.2978515625,
+      "percent_of_diffusion": 2.500679596909525
+    },
+    {
+      "block_index": 31,
+      "time_ms": 1471.5299072265625,
+      "percent_of_diffusion": 2.4976788036044493
+    },
+    {
+      "block_index": 32,
+      "time_ms": 1473.5533447265625,
+      "percent_of_diffusion": 2.501113254327706
+    },
+    {
+      "block_index": 33,
+      "time_ms": 1473.824951171875,
+      "percent_of_diffusion": 2.5015742613776126
+    },
+    {
+      "block_index": 34,
+      "time_ms": 1475.37060546875,
+      "percent_of_diffusion": 2.504197754081394
+    },
+    {
+      "block_index": 35,
+      "time_ms": 1474.509033203125,
+      "percent_of_diffusion": 2.502735377560837
+    },
+    {
+      "block_index": 36,
+      "time_ms": 1473.6343994140625,
+      "percent_of_diffusion": 2.5012508312630493
+    },
+    {
+      "block_index": 37,
+      "time_ms": 1475.8204345703125,
+      "percent_of_diffusion": 2.5049612646337107
+    },
+    {
+      "block_index": 38,
+      "time_ms": 1475.8629150390625,
+      "percent_of_diffusion": 2.5050333682082577
+    },
+    {
+      "block_index": 39,
+      "time_ms": 1479.3565673828125,
+      "percent_of_diffusion": 2.5109632656322205
+    }
+  ],
+  "batch_size": 1,
+  "num_blocks": 40,
+  "num_output_frames": 120,
+  "num_frame_per_block": 3,
+  "local_attn_size": 12,
+  "kv_cache_size": 18720,
+  "device": "cuda:0",
+  "rank": 0,
+  "timestamp": "20251114_025238_566230"
+}

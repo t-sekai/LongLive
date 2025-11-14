@@ -1,4 +1,5 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import os
 import torch
 
 try:
@@ -18,6 +19,8 @@ try:
     FLASH_ATTN_2_AVAILABLE = True
 except ModuleNotFoundError:
     FLASH_ATTN_2_AVAILABLE = False
+
+USE_FLASH_ATTN_3 = FLASH_ATTN_3_AVAILABLE and os.environ.get("LONGLIVE_DISABLE_FA3", "0") != "1"
 
 # FLASH_ATTN_3_AVAILABLE = False
 
@@ -63,6 +66,7 @@ def flash_attention(
 
     # params
     b, lq, lk, out_dtype = q.size(0), q.size(1), k.size(1), q.dtype
+    total_queries = None
 
     def half(x):
         return x if x.dtype in half_dtypes else x.to(dtype)
@@ -70,11 +74,14 @@ def flash_attention(
     # preprocess query
     if q_lens is None:
         q = half(q.flatten(0, 1))
+        num_heads = q.size(1)
         q_lens = torch.tensor(
             [lq] * b, dtype=torch.int32).to(
                 device=q.device, non_blocking=True)
     else:
         q = half(torch.cat([u[:v] for u, v in zip(q, q_lens)]))
+        num_heads = q.size(1)
+    total_queries = int(q_lens.sum().item())
 
     # preprocess key, value
     if k_lens is None:
@@ -99,23 +106,45 @@ def flash_attention(
         )
 
     # apply attention
-    if (version is None or version == 3) and FLASH_ATTN_3_AVAILABLE:
+    global USE_FLASH_ATTN_3
+    x = None
+    if (version is None or version == 3) and USE_FLASH_ATTN_3:
         # Note: dropout_p, window_size are not supported in FA3 now.
-        x = flash_attn_interface.flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(
-                0, dtype=torch.int32).to(q.device, non_blocking=True),
-            cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(
-                0, dtype=torch.int32).to(q.device, non_blocking=True),
-            max_seqlen_q=lq,
-            max_seqlen_k=lk,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            deterministic=deterministic)[0].unflatten(0, (b, lq))
-    else:
-        assert FLASH_ATTN_2_AVAILABLE
+        try:
+            fa3_out = flash_attn_interface.flash_attn_varlen_func(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(
+                    0, dtype=torch.int32).to(q.device, non_blocking=True),
+                cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(
+                    0, dtype=torch.int32).to(q.device, non_blocking=True),
+                max_seqlen_q=lq,
+                max_seqlen_k=lk,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                deterministic=deterministic)[0]
+            if fa3_out.size(0) == total_queries:
+                x = fa3_out
+            elif fa3_out.dim() == 3 and fa3_out.size(0) == num_heads and fa3_out.size(1) == total_queries:
+                # FlashAttention-3 may return [num_heads, total_queries, head_dim]
+                x = fa3_out.permute(1, 0, 2).contiguous()
+            else:
+                raise RuntimeError(
+                    f"Unexpected FlashAttention-3 output shape {tuple(fa3_out.shape)}; "
+                    f"expected ({total_queries}, {num_heads}, head_dim) or "
+                    f"({num_heads}, {total_queries}, head_dim)."
+                )
+            x = x.unflatten(0, (b, lq))
+        except RuntimeError as err:
+            warnings.warn(
+                f"FlashAttention-3 failed ({err}); falling back to FlashAttention-2.",
+                stacklevel=2,
+            )
+            USE_FLASH_ATTN_3 = False
+            x = None
+    if x is None:
+        assert FLASH_ATTN_2_AVAILABLE, "FlashAttention-2 is not available"
         x = flash_attn.flash_attn_varlen_func(
             q=q,
             k=k,

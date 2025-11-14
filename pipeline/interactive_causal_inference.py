@@ -9,6 +9,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from typing import List, Optional
 import torch
+import numpy as np
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from utils.memory import gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation
@@ -102,6 +103,8 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         switch_frame_indices: List[int],
         return_latents: bool = False,
         low_memory: bool = False,
+        profile: bool = False,
+        profile_output_dir: Optional[str] = None,
     ):
         """Generate a video and switch prompts at specified frame indices.
 
@@ -141,6 +144,28 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             dtype=noise.dtype
         )
 
+        # Set up profiling if requested
+        profiling_summary = None
+        if profile:
+            init_start = torch.cuda.Event(enable_timing=True)
+            init_end = torch.cuda.Event(enable_timing=True)
+            diffusion_start = torch.cuda.Event(enable_timing=True)
+            diffusion_end = torch.cuda.Event(enable_timing=True)
+            vae_start = torch.cuda.Event(enable_timing=True)
+            vae_end = torch.cuda.Event(enable_timing=True)
+            block_times = []
+            block_start = torch.cuda.Event(enable_timing=True)
+            block_end = torch.cuda.Event(enable_timing=True)
+            recache_times = []
+            recache_start = torch.cuda.Event(enable_timing=True)
+            recache_end = torch.cuda.Event(enable_timing=True)
+
+            frame_latencies_ms = []         # steady-state inter-frame
+            prompt_switch_latencies_ms = [] # per prompt switch
+            measuring_prompt_switch = False
+            prompt_switch_start = torch.cuda.Event(enable_timing=True)
+            init_start.record()
+
         # initialize caches
         local_attn_cfg = getattr(self.args.model_kwargs, "local_attn_size", -1)
         kv_policy = ""
@@ -171,6 +196,11 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         print(f"[inference] local_attn_size set on model: {self.generator.model.local_attn_size}")
         self._set_all_modules_max_attention_size(self.local_attn_size)
 
+        if profile:
+            init_end.record()
+            torch.cuda.synchronize()
+            diffusion_start.record()
+
         # temporal denoising by blocks
         all_num_frames = [self.num_frame_per_block] * num_blocks
         segment_idx = 0  # current segment index
@@ -186,6 +216,9 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
 
         for current_num_frames in all_num_frames:
             if next_switch_pos is not None and current_start_frame >= next_switch_pos:
+                if profile:
+                    prompt_switch_start.record()
+                    recache_start.record()
                 segment_idx += 1
                 self._recache_after_switch(output, current_start_frame, cond_list[segment_idx])
                 if DEBUG:
@@ -197,9 +230,20 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                     if segment_idx < len(switch_frame_indices)
                     else None
                 )
+
+                if profile:
+                    recache_end.record()
+                    torch.cuda.synchronize()
+                    recache_elapsed = recache_start.elapsed_time(recache_end)
+                    recache_times.append(recache_elapsed)
+                    measuring_prompt_switch = True
+
                 print(f"segment_idx: {segment_idx}")
                 print(f"text_prompts_list[segment_idx]: {text_prompts_list[segment_idx]}")
             cond_in_use = cond_list[segment_idx]
+
+            if profile:
+                block_start.record()
 
             noisy_input = noise[
                 :, current_start_frame : current_start_frame + current_num_frames
@@ -256,12 +300,110 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 current_start=current_start_frame * self.frame_seq_length,
             )
 
+            if profile:
+                block_end.record()
+                torch.cuda.synchronize()
+                block_elapsed = block_start.elapsed_time(block_end)
+                block_times.append(block_elapsed)
+                per_frame_latency_ms = block_elapsed / float(current_num_frames)
+                frame_latencies_ms.append(per_frame_latency_ms)
+                if measuring_prompt_switch:
+                    # Time from prompt_switch_start to the end of the first block
+                    # that uses the new prompt.
+                    switch_elapsed_ms = prompt_switch_start.elapsed_time(block_end)
+                    prompt_switch_latencies_ms.append(switch_elapsed_ms)
+                    measuring_prompt_switch = False
+
             # Update frame pointer
             current_start_frame += current_num_frames
+
+        if profile:
+            # End diffusion timing and synchronize CUDA
+            diffusion_end.record()
+            torch.cuda.synchronize()
+            diffusion_time = diffusion_start.elapsed_time(diffusion_end)
+            init_time = init_start.elapsed_time(init_end)
+            vae_start.record()
 
         # Standard decoding
         video = self.vae.decode_to_pixel(output.to(noise.device), use_cache=False)
         video = (video * 0.5 + 0.5).clamp(0, 1)
+        if profile:
+            vae_end.record()
+            torch.cuda.synchronize()
+            vae_time = vae_start.elapsed_time(vae_end)
+            total_time = init_time + diffusion_time + vae_time
+            init_pct = 100 * init_time / total_time if total_time else 0.0
+            diffusion_pct = 100 * diffusion_time / total_time if total_time else 0.0
+            vae_pct = 100 * vae_time / total_time if total_time else 0.0
+            block_stats = []
+            for i, block_time in enumerate(block_times):
+                percent = 100 * block_time / diffusion_time if diffusion_time else 0.0
+                block_stats.append({
+                    "block_index": i,
+                    "time_ms": block_time,
+                    "percent_of_diffusion": percent
+                })
+            recache_stats = []
+            for i, recache_time in enumerate(recache_times):
+                percent = 100 * recache_time / diffusion_time if diffusion_time else 0.0
+                recache_stats.append({
+                    "recache_index": i,
+                    "time_ms": recache_time,
+                    "percent_of_diffusion": percent
+                })
+            # Steady-state inter-frame latency
+            inter_frame_mean = float(np.mean(frame_latencies_ms)) if frame_latencies_ms else 0.0
+            inter_frame_p95  = float(np.percentile(frame_latencies_ms, 95)) if frame_latencies_ms else 0.0
+            inter_frame_max  = float(np.max(frame_latencies_ms)) if frame_latencies_ms else 0.0
+            # Prompt-switch latency
+            prompt_switch_mean = float(np.mean(prompt_switch_latencies_ms)) if prompt_switch_latencies_ms else 0.0
+            prompt_switch_max  = float(np.max(prompt_switch_latencies_ms)) if prompt_switch_latencies_ms else 0.0
+            # Prepare profiling summary
+            profiling_summary = {
+                "init_time_ms": init_time,
+                "init_percentage": init_pct,
+                "diffusion_time_ms": diffusion_time,
+                "diffusion_percentage": diffusion_pct,
+                "vae_time_ms": vae_time,
+                "vae_percentage": vae_pct,
+                "total_time_ms": total_time,
+                "block_stats": block_stats,
+                "recache_stats": recache_stats,
+                "batch_size": batch_size,                
+                "num_blocks": len(block_stats),
+                "num_output_frames": num_output_frames,
+                "num_frame_per_block": self.num_frame_per_block,
+                "local_attn_size": self.local_attn_size,
+                "kv_cache_size": kv_cache_size,
+                "device": str(noise.device),
+
+                "inter_frame_latency_ms_mean": inter_frame_mean,
+                "inter_frame_latency_ms_p95": inter_frame_p95,
+                "inter_frame_latency_ms_max": inter_frame_max,
+
+                "prompt_switch_latencies_ms": prompt_switch_latencies_ms,
+                "prompt_switch_latency_ms_mean": prompt_switch_mean,
+                "prompt_switch_latency_ms_max": prompt_switch_max,
+            }
+
+            print("Profiling results:")
+            print(f"  - Initialization/caching time: {init_time:.2f} ms ({init_pct:.2f}%)")
+            print(f"  - Diffusion generation time: {diffusion_time:.2f} ms ({diffusion_pct:.2f}%)")
+            for i, block_time in enumerate(block_times):
+                percent = 100 * block_time / diffusion_time if diffusion_time else 0.0
+                print(f"    - Block {i} generation time: {block_time:.2f} ms ({percent:.2f}% of diffusion)")
+            print(f"  - VAE decoding time: {vae_time:.2f} ms ({vae_pct:.2f}%)")
+            print(f"  - Total time: {total_time:.2f} ms")
+
+            print(f"  - Inter-frame latency (mean): {inter_frame_mean:.2f} ms")
+            print(f"  - Inter-frame latency (p95):  {inter_frame_p95:.2f} ms")
+            print(f"  - Inter-frame latency (max):  {inter_frame_max:.2f} ms")
+            if prompt_switch_latencies_ms:
+                print(f"  - Prompt-switch latency (mean): {prompt_switch_mean:.2f} ms")
+                print(f"  - Prompt-switch latency (max):  {prompt_switch_max:.2f} ms")
+            if profile_output_dir and profiling_summary is not None:
+                self._write_profiling_results(profile_output_dir, profiling_summary, interactive=True)
 
         if return_latents:
             return video, output

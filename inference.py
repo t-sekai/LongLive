@@ -60,7 +60,7 @@ else:
 
 print(f'Free VRAM {get_cuda_free_memory_gb(device)} GB')
 low_memory = get_cuda_free_memory_gb(device) < 40
-low_memory = True
+low_memory = False # TODO: Debug: disable low memory mode for profiling
 
 torch.set_grad_enabled(False)
 
@@ -204,12 +204,16 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     # print('pipeline.text_encoder', pipeline.text_encoder)
     # print('pipeline.vae', pipeline.vae)
 
+    enable_profiling = False if getattr(config, "profile", None) is None else config.profile
+    profiling_output_dir = getattr(config, "profile_output_dir", None)
+
     video, latents = pipeline.inference(
         noise=sampled_noise,
         text_prompts=prompts,
         return_latents=True,
         low_memory=low_memory,
-        profile=False,
+        profile=enable_profiling,
+        profile_output_dir=profiling_output_dir,
     )
     current_video = rearrange(video, 'b t c h w -> b t h w c').cpu()
     all_video.append(current_video)

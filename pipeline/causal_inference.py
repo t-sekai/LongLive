@@ -1,8 +1,10 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: Apache-2.0
 from typing import List, Optional
-import torch
+import json
 import os
+from datetime import datetime
+import torch
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
@@ -60,6 +62,7 @@ class CausalInferencePipeline(torch.nn.Module):
         return_latents: bool = False,
         profile: bool = False,
         low_memory: bool = False,
+        profile_output_dir: Optional[str] = None,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -68,6 +71,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 (batch_size, num_output_frames, num_channels, height, width).
             text_prompts (List[str]): The list of text prompts.
             return_latents (bool): Whether to return the latents.
+            profile_output_dir (Optional[str]): Directory for JSON profiling logs when `profile` is True.
         Outputs:
             video (torch.Tensor): The generated video tensor of shape
                 (batch_size, num_output_frames, num_channels, height, width).
@@ -94,6 +98,7 @@ class CausalInferencePipeline(torch.nn.Module):
         )
 
         # Set up profiling if requested
+        profiling_summary = None
         if profile:
             init_start = torch.cuda.Event(enable_timing=True)
             init_end = torch.cuda.Event(enable_timing=True)
@@ -225,14 +230,45 @@ class CausalInferencePipeline(torch.nn.Module):
             torch.cuda.synchronize()
             vae_time = vae_start.elapsed_time(vae_end)
             total_time = init_time + diffusion_time + vae_time
+            init_pct = 100 * init_time / total_time if total_time else 0.0
+            diffusion_pct = 100 * diffusion_time / total_time if total_time else 0.0
+            vae_pct = 100 * vae_time / total_time if total_time else 0.0
+            block_stats = []
+            for i, block_time in enumerate(block_times):
+                percent = 100 * block_time / diffusion_time if diffusion_time else 0.0
+                block_stats.append({
+                    "block_index": i,
+                    "time_ms": block_time,
+                    "percent_of_diffusion": percent
+                })
+            profiling_summary = {
+                "init_time_ms": init_time,
+                "init_percentage": init_pct,
+                "diffusion_time_ms": diffusion_time,
+                "diffusion_percentage": diffusion_pct,
+                "vae_time_ms": vae_time,
+                "vae_percentage": vae_pct,
+                "total_time_ms": total_time,
+                "block_stats": block_stats,
+                "batch_size": batch_size,
+                "num_blocks": len(block_stats),
+                "num_output_frames": num_output_frames,
+                "num_frame_per_block": self.num_frame_per_block,
+                "local_attn_size": self.local_attn_size,
+                "kv_cache_size": kv_cache_size,
+                "device": str(noise.device),
+            }
 
             print("Profiling results:")
-            print(f"  - Initialization/caching time: {init_time:.2f} ms ({100 * init_time / total_time:.2f}%)")
-            print(f"  - Diffusion generation time: {diffusion_time:.2f} ms ({100 * diffusion_time / total_time:.2f}%)")
+            print(f"  - Initialization/caching time: {init_time:.2f} ms ({init_pct:.2f}%)")
+            print(f"  - Diffusion generation time: {diffusion_time:.2f} ms ({diffusion_pct:.2f}%)")
             for i, block_time in enumerate(block_times):
-                print(f"    - Block {i} generation time: {block_time:.2f} ms ({100 * block_time / diffusion_time:.2f}% of diffusion)")
-            print(f"  - VAE decoding time: {vae_time:.2f} ms ({100 * vae_time / total_time:.2f}%)")
+                percent = 100 * block_time / diffusion_time if diffusion_time else 0.0
+                print(f"    - Block {i} generation time: {block_time:.2f} ms ({percent:.2f}% of diffusion)")
+            print(f"  - VAE decoding time: {vae_time:.2f} ms ({vae_pct:.2f}%)")
             print(f"  - Total time: {total_time:.2f} ms")
+            if profile_output_dir and profiling_summary is not None:
+                self._write_profiling_results(profile_output_dir, profiling_summary, interactive=False)
 
         if return_latents:
             return video, output.to(noise.device)
@@ -314,3 +350,22 @@ class CausalInferencePipeline(torch.nn.Module):
                     updated_modules.append(name if name else module.__class__.__name__)
                 except Exception:
                     pass
+
+    def _write_profiling_results(self, output_dir: str, profile_data: dict, interactive: bool) -> None:
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+            filename = f"profile_rank{rank}_{timestamp}.json"
+            output_path = os.path.join(output_dir, filename)
+            if interactive:
+                output_path = os.path.join(output_dir, "interactive_" + filename)
+            profile_data = dict(profile_data)
+            profile_data["rank"] = rank
+            profile_data["timestamp"] = timestamp
+            with open(output_path, "w", encoding="utf-8") as out_file:
+                json.dump(profile_data, out_file, indent=2)
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                print(f"Profiling stats saved to {output_path}")
+        except Exception as exc:
+            print(f"Failed to save profiling stats to {output_dir}: {exc}")

@@ -14,7 +14,7 @@ model_kwargs:
 
 
 # Inference
-data_path: longlive_models/prompts/interactive_example.jsonl
+data_path: debug/interactive_tiny.jsonl
 output_folder: videos/interactive
 inference_iter: -1
 num_output_frames: 240
@@ -36,3 +36,6 @@ adapter:
   dropout: 0.0                # LoRA dropout rate
   dtype: "bfloat16"          # Data type for LoRA parameters: "bfloat16", "float16", "float32"
   verbose: false              # Whether to print all target module names
+
+profile: true
+profile_output_dir: moonlake/results/baseline

@@ -190,12 +190,19 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         dtype=torch.bfloat16,
     )
 
+    enable_profiling = False if getattr(config, "profile", None) is None else config.profile
+    profiling_output_dir = getattr(config, "profile_output_dir", None)
+
     video = pipeline.inference(
         noise=sampled_noise,
         text_prompts_list=prompts_list,
         switch_frame_indices=switch_frame_indices,
         return_latents=False,
+        profile=enable_profiling,
+        profile_output_dir=profiling_output_dir,
     )
+
+    import pdb; pdb.set_trace()
 
     current_video = rearrange(video, "b t c h w -> b t h w c").cpu() * 255.0
 
