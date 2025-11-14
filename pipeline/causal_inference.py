@@ -46,6 +46,9 @@ class CausalInferencePipeline(torch.nn.Module):
         self.args = args
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.local_attn_size = args.model_kwargs.local_attn_size
+        self._profiling_state = None
+        self.last_profiling_summary = None
+        self._profile_cached_quantized_video = None
 
         # Normalize to list if sequence-like (e.g., OmegaConf ListConfig)
 
@@ -54,6 +57,28 @@ class CausalInferencePipeline(torch.nn.Module):
 
         if self.num_frame_per_block > 1:
             self.generator.model.num_frame_per_block = self.num_frame_per_block
+
+    def _set_module_profiling_state(self, profiling_state):
+        """
+        Attach or clear profiling state on generator/VAE modules so they can emit fine-grained metrics.
+        """
+        self._profiling_state = profiling_state
+        modules_to_visit = []
+        if hasattr(self.generator, "modules"):
+            modules_to_visit.append(self.generator)
+        model = getattr(self.generator, "model", None)
+        if hasattr(model, "modules"):
+            modules_to_visit.append(model)
+        if hasattr(self.vae, "modules"):
+            modules_to_visit.append(self.vae)
+
+        for root in modules_to_visit:
+            for module in root.modules():
+                if profiling_state is None:
+                    if hasattr(module, "_profiling_state"):
+                        delattr(module, "_profiling_state")
+                else:
+                    setattr(module, "_profiling_state", profiling_state)
 
     def inference(
         self,

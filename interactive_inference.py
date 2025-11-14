@@ -202,9 +202,11 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         profile_output_dir=profiling_output_dir,
     )
 
-    import pdb; pdb.set_trace()
-
-    current_video = rearrange(video, "b t c h w -> b t h w c").cpu() * 255.0
+    cached_quantized = getattr(pipeline, "_profile_cached_quantized_video", None)
+    if cached_quantized is not None:
+        current_video = rearrange(cached_quantized, "b t c h w -> b t h w c").cpu()
+    else:
+        current_video = rearrange(video, "b t c h w -> b t h w c").cpu() * 255.0
 
     if dist.is_initialized():
         rank = dist.get_rank()
@@ -226,7 +228,10 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
             # Use the first prompt segment as the filename prefix to avoid overly long names
             short_name = prompts_list[0][0][:100].replace("/", "_")
             output_path = os.path.join(config.output_folder, f"rank{rank}-{short_name}-{seed_idx}_{model_type}.mp4")
-        write_video(output_path, current_video[seed_idx].to(torch.uint8), fps=16)
+        if cached_quantized is not None:
+            write_video(output_path, current_video[seed_idx], fps=16)
+        else:
+            write_video(output_path, current_video[seed_idx].to(torch.uint8), fps=16)
 
     if config.inference_iter != -1 and i >= config.inference_iter:
         break

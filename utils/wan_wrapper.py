@@ -1,11 +1,13 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: Apache-2.0
 import types
+import time
 from typing import List, Optional
 import torch
 from torch import nn
 
 from utils.scheduler import SchedulerInterface, FlowMatchScheduler
+from utils.profiling import append_timing
 from wan.modules.tokenizers import HuggingfaceTokenizer
 from wan.modules.model import WanModel, RegisterTokens, GanAttentionBlock
 from wan.modules.vae import _video_vae
@@ -82,6 +84,13 @@ class WanVAEWrapper(torch.nn.Module):
         device, dtype = pixel.device, pixel.dtype
         scale = [self.mean.to(device=device, dtype=dtype),
                  1.0 / self.std.to(device=device, dtype=dtype)]
+        profiling_state = getattr(self, "_profiling_state", None)
+        use_cuda_timing = profiling_state is not None and pixel.is_cuda
+        encode_start_evt = torch.cuda.Event(enable_timing=True) if use_cuda_timing else None
+        encode_end_evt = torch.cuda.Event(enable_timing=True) if use_cuda_timing else None
+        encode_cpu_start = time.perf_counter() if (profiling_state is not None and not use_cuda_timing) else None
+        if encode_start_evt is not None:
+            encode_start_evt.record()
 
         output = [
             self.model.encode(u.unsqueeze(0), scale).float().squeeze(0)
@@ -91,6 +100,14 @@ class WanVAEWrapper(torch.nn.Module):
         # from [batch_size, num_channels, num_frames, height, width]
         # to [batch_size, num_frames, num_channels, height, width]
         output = output.permute(0, 2, 1, 3, 4)
+        if profiling_state is not None:
+            if encode_start_evt is not None and encode_end_evt is not None:
+                encode_end_evt.record()
+                torch.cuda.synchronize()
+                duration_ms = encode_start_evt.elapsed_time(encode_end_evt)
+            else:
+                duration_ms = (time.perf_counter() - encode_cpu_start) * 1000.0 if encode_cpu_start is not None else 0.0
+            append_timing(profiling_state["vae_encode_ms"], duration_ms)
         return output
 
     def decode_to_pixel(self, latent: torch.Tensor, use_cache: bool = False) -> torch.Tensor:
@@ -101,6 +118,13 @@ class WanVAEWrapper(torch.nn.Module):
         device, dtype = latent.device, latent.dtype
         scale = [self.mean.to(device=device, dtype=dtype),
                  1.0 / self.std.to(device=device, dtype=dtype)]
+        profiling_state = getattr(self, "_profiling_state", None)
+        use_cuda_timing = profiling_state is not None and latent.is_cuda
+        decode_start_evt = torch.cuda.Event(enable_timing=True) if use_cuda_timing else None
+        decode_end_evt = torch.cuda.Event(enable_timing=True) if use_cuda_timing else None
+        decode_cpu_start = time.perf_counter() if (profiling_state is not None and not use_cuda_timing) else None
+        if decode_start_evt is not None:
+            decode_start_evt.record()
 
         if use_cache:
             decode_function = self.model.cached_decode
@@ -114,6 +138,14 @@ class WanVAEWrapper(torch.nn.Module):
         # from [batch_size, num_channels, num_frames, height, width]
         # to [batch_size, num_frames, num_channels, height, width]
         output = output.permute(0, 2, 1, 3, 4)
+        if profiling_state is not None:
+            if decode_start_evt is not None and decode_end_evt is not None:
+                decode_end_evt.record()
+                torch.cuda.synchronize()
+                duration_ms = decode_start_evt.elapsed_time(decode_end_evt)
+            else:
+                duration_ms = (time.perf_counter() - decode_cpu_start) * 1000.0 if decode_cpu_start is not None else 0.0
+            append_timing(profiling_state["vae_decode_ms"], duration_ms)
         return output
 
 
