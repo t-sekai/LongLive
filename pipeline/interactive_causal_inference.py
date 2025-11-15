@@ -199,6 +199,8 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             recache_end = torch.cuda.Event(enable_timing=True)
             denoise_step_start = torch.cuda.Event(enable_timing=True)
             denoise_step_end = torch.cuda.Event(enable_timing=True)
+            add_noise_start = torch.cuda.Event(enable_timing=True)
+            add_noise_end = torch.cuda.Event(enable_timing=True)
 
             frame_latencies_ms = []         # steady-state inter-frame
             prompt_switch_latencies_ms = [] # per prompt switch
@@ -310,25 +312,26 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                     dtype=torch.int64)
                     * current_timestep
                 )
-
+                if profile:
+                    denoise_step_start.record()
+                _, denoised_pred = self.generator(
+                    noisy_image_or_video=noisy_input,
+                    conditional_dict=cond_in_use,
+                    timestep=timestep,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=current_start_frame * self.frame_seq_length,
+                )
+                if profile:
+                    denoise_step_end.record()
+                    denoise_step_end.synchronize()
+                    append_timing(
+                        profiling_state["denoising_step_ms"][int(index)],
+                        denoise_step_start.elapsed_time(denoise_step_end)
+                    )
                 if index < len(self.denoising_step_list) - 1:
                     if profile:
-                        denoise_step_start.record()
-                    _, denoised_pred = self.generator(
-                        noisy_image_or_video=noisy_input,
-                        conditional_dict=cond_in_use,
-                        timestep=timestep,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length,
-                    )
-                    if profile:
-                        denoise_step_end.record()
-                        denoise_step_end.synchronize()
-                        append_timing(
-                            profiling_state["denoising_step_ms"][int(index)],
-                            denoise_step_start.elapsed_time(denoise_step_end)
-                        )
+                        add_noise_start.record()
                     next_timestep = self.denoising_step_list[index + 1]
                     noisy_input = self.scheduler.add_noise(
                         denoised_pred.flatten(0, 1),
@@ -338,23 +341,12 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                             [batch_size * current_num_frames], device=noise.device, dtype=torch.long
                         ),
                     ).unflatten(0, denoised_pred.shape[:2])
-                else:
                     if profile:
-                        denoise_step_start.record()
-                    _, denoised_pred = self.generator(
-                        noisy_image_or_video=noisy_input,
-                        conditional_dict=cond_in_use,
-                        timestep=timestep,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length,
-                    )
-                    if profile:
-                        denoise_step_end.record()
-                        denoise_step_end.synchronize()
+                        add_noise_end.record()
+                        add_noise_end.synchronize()
                         append_timing(
-                            profiling_state["denoising_step_ms"][int(index)],
-                            denoise_step_start.elapsed_time(denoise_step_end)
+                            profiling_state["add_noise_step_ms"][int(index)],
+                            add_noise_start.elapsed_time(add_noise_end)
                         )
 
             # Record output
@@ -494,6 +486,13 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                     stats["step_index"] = int(step_idx)
                     denoising_step_stats.append(stats)
 
+            add_noise_step_stats = []
+            if profiling_state is not None:
+                for step_idx in sorted(profiling_state["add_noise_step_ms"].keys()):
+                    stats = _basic_stats(profiling_state["add_noise_step_ms"][step_idx])
+                    stats["step_index"] = int(step_idx)
+                    add_noise_step_stats.append(stats)
+
             attention_kernel_stats = {}
             if profiling_state is not None:
                 attention_kernel_stats = {
@@ -562,6 +561,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 "prompt_switch_latency_ms_mean": prompt_switch_mean,
                 "prompt_switch_latency_ms_max": prompt_switch_max,
                 "denoising_step_stats": denoising_step_stats,
+                "add_noise_step_stats": add_noise_step_stats,
                 "attention_kernel_stats": attention_kernel_stats,
                 "kv_operation_stats": kv_operation_stats,
                 "kv_recache_breakdown_ms": kv_recache_summary,

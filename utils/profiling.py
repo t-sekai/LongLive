@@ -8,6 +8,7 @@ def create_profiling_state() -> Dict[str, Any]:
     """Create a nested dictionary used to accumulate profiling samples."""
     return {
         "denoising_step_ms": defaultdict(list),      # step_index -> [durations]
+        "add_noise_step_ms": defaultdict(list),      # step_index -> [durations]
         "attention_kernel_ms": {"self": [], "cross": []},
         "attention_kernel_counts": {"self": 0, "cross": 0},
         "kv_prepare_ms": [],
