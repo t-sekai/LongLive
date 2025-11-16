@@ -33,6 +33,14 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         super().__init__(args, device, generator=generator, text_encoder=text_encoder, vae=vae)
         self.global_sink = getattr(args, "global_sink", False)
 
+        # --- CUDA Graph related ---
+        self.use_cuda_graphs = getattr(args, "use_cuda_graphs", False)
+        self._denoise_graph = None
+        self._static_noisy_input = None
+        self._static_timestep = None
+        self._static_cond = None
+        self._static_out_pred = None
+
     # Internal helpers
     def _recache_after_switch(self, output, current_start_frame, new_conditional_dict):
         profiling_state = getattr(self, "_profiling_state", None)
@@ -150,6 +158,9 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             low_memory: Enable low-memory mode.
         """
         batch_size, num_output_frames, num_channels, height, width = noise.shape
+        self.latent_channels = num_channels
+        self.latent_height = height
+        self.latent_width = width
         assert len(text_prompts_list) >= 1, "text_prompts_list must not be empty"
         assert len(switch_frame_indices) == len(text_prompts_list) - 1, (
             "length of switch_frame_indices should be one less than text_prompts_list"
@@ -285,7 +296,12 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                     if segment_idx < len(switch_frame_indices)
                     else None
                 )
-
+                if self.use_cuda_graphs:
+                    self._denoise_graph = None
+                    self._static_noisy_input = None
+                    self._static_timestep = None
+                    self._static_cond = None
+                    self._static_out_pred = None
                 if profile:
                     recache_end.record()
                     record_cuda_sync("recache_switch")
@@ -312,16 +328,42 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                     dtype=torch.int64)
                     * current_timestep
                 )
+                use_graph = (
+                    self.use_cuda_graphs
+                    # and not profile              # graphs + profiling don't mix well
+                    and noise.is_cuda
+                )
+                if use_graph and self._denoise_graph is None:
+                    # Capture once, on the first step of the first block of a segment
+                    self._capture_denoise_graph(
+                        batch_size=batch_size,
+                        current_num_frames=current_num_frames,
+                        noise_device=noise.device,
+                        cond_in_use=cond_in_use,
+                        current_start_frame=current_start_frame,
+                    )
                 if profile:
                     denoise_step_start.record()
-                _, denoised_pred = self.generator(
-                    noisy_image_or_video=noisy_input,
-                    conditional_dict=cond_in_use,
-                    timestep=timestep,
-                    kv_cache=self.kv_cache1,
-                    crossattn_cache=self.crossattn_cache,
-                    current_start=current_start_frame * self.frame_seq_length,
-                )
+                if use_graph and self._denoise_graph is not None:
+                    # Copy inputs into static buffers
+                    self._static_noisy_input.copy_(noisy_input)
+                    self._static_timestep.copy_(timestep)
+                    # cond is static per segment; if prompts change, you should
+                    # reset self._denoise_graph = None and re-capture.
+
+                    # Replay the graph
+                    self._denoise_graph.replay()
+                    denoised_pred = self._static_out_pred
+                else:
+                    # Fallback: normal eager execution
+                    _, denoised_pred = self.generator(
+                        noisy_image_or_video=noisy_input,
+                        conditional_dict=cond_in_use,
+                        timestep=timestep,
+                        kv_cache=self.kv_cache1,
+                        crossattn_cache=self.crossattn_cache,
+                        current_start=current_start_frame * self.frame_seq_length,
+                    )
                 if profile:
                     denoise_step_end.record()
                     denoise_step_end.synchronize()
@@ -596,3 +638,80 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         if return_latents:
             return video, output
         return video 
+
+    def _capture_denoise_graph(
+        self,
+        batch_size: int,
+        current_num_frames: int,
+        noise_device: torch.device,
+        cond_in_use: dict,
+        current_start_frame: int,
+    ):
+        """
+        Capture a CUDA Graph for one generator denoising step:
+            (noisy_input, timestep, cond, kv_cache, crossattn_cache) -> pred_x0
+        Assumes:
+            - shapes / dtypes are fixed across replays
+            - kv_cache / crossattn_cache already initialized and on GPU
+        """
+        if self._denoise_graph is not None:
+            return  # already captured
+
+        device = noise_device
+        dtype = next(self.generator.parameters()).dtype
+
+        # Allocate static tensors that live for the lifetime of the graph
+        self._static_noisy_input = torch.empty(
+            batch_size, current_num_frames, self.latent_channels,  # 16
+            self.latent_height, self.latent_width,                 # 60, 104
+            device=device, dtype=dtype,
+        )
+
+        self._static_timestep = torch.empty(
+            batch_size, current_num_frames,
+            device=device, dtype=torch.int64,
+        )
+
+        # We assume prompt_embeds shape is stable within a segment
+        prompt_embeds = cond_in_use["prompt_embeds"].to(device)
+        self._static_cond = {"prompt_embeds": prompt_embeds}
+
+        # Output buffer
+        self._static_out_pred = torch.empty_like(self._static_noisy_input)
+
+         # ---- Warmup eager forward to move freqs & do lazy init ----
+        # Values don't matter; shapes do.
+        self._static_noisy_input.zero_()
+        self._static_timestep.zero_()
+
+        # This forward runs in normal eager mode (no capture yet),
+        # so it's allowed to do `self.freqs = self.freqs.to(device)` etc.
+        torch.cuda.synchronize()
+        _ = self.generator(
+            noisy_image_or_video=self._static_noisy_input,
+            conditional_dict=self._static_cond,
+            timestep=self._static_timestep,
+            kv_cache=self.kv_cache1,
+            crossattn_cache=self.crossattn_cache,
+            current_start=current_start_frame * self.frame_seq_length,
+        )
+        torch.cuda.synchronize()
+
+        # Warmup before capture
+        g = torch.cuda.CUDAGraph()
+
+        # Use the static buffers inside the capture
+        with torch.cuda.graph(g):
+            # NOTE: we always use kv_cache / crossattn_cache in inference
+            _, pred_x0 = self.generator(
+                noisy_image_or_video=self._static_noisy_input,
+                conditional_dict=self._static_cond,
+                timestep=self._static_timestep,
+                kv_cache=self.kv_cache1,
+                crossattn_cache=self.crossattn_cache,
+                current_start=current_start_frame * self.frame_seq_length,
+            )
+            # Write into static output buffer
+            self._static_out_pred.copy_(pred_x0)
+
+        self._denoise_graph = g

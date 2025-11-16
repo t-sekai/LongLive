@@ -17,8 +17,10 @@ from diffusers.models.modeling_utils import ModelMixin
 import torch.nn as nn
 import torch
 import math
+import time
 import torch.distributed as dist
 from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, log_gpu_memory
+from utils.profiling import append_timing
 
 from utils.debug_option import DEBUG
 
@@ -28,7 +30,7 @@ from utils.debug_option import DEBUG
 flex_attention = torch.compile(
     flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
 
-@torch.compile(dynamic=False, fullgraph=False)
+
 def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
     n, c = x.size(2), x.size(3) // 2
 
@@ -125,6 +127,21 @@ class CausalWanSelfAttention(nn.Module):
             return q, k, v
 
         q, k, v = qkv_fn(x)
+        profiling_state = getattr(self, "_profiling_state", None)
+
+        def _time_attention(kind: str, fn):
+            if profiling_state is None:
+                return fn()
+            start_evt = torch.cuda.Event(enable_timing=True)
+            end_evt = torch.cuda.Event(enable_timing=True)
+            start_evt.record()
+            result = fn()
+            end_evt.record()
+            torch.cuda.synchronize()
+            duration_ms = start_evt.elapsed_time(end_evt)
+            append_timing(profiling_state["attention_kernel_ms"][kind], duration_ms)
+            profiling_state["attention_kernel_counts"][kind] += 1
+            return result
 
         if kv_cache is None:
             # if it is teacher forcing training?
@@ -164,12 +181,15 @@ class CausalWanSelfAttention(nn.Module):
                     dim=1
                 )
 
-                x = flex_attention(
-                    query=padded_roped_query.transpose(2, 1),
-                    key=padded_roped_key.transpose(2, 1),
-                    value=padded_v.transpose(2, 1),
-                    block_mask=block_mask
-                )[:, :, :-padded_length].transpose(2, 1)
+                def _flex_call():
+                    return flex_attention(
+                        query=padded_roped_query.transpose(2, 1),
+                        key=padded_roped_key.transpose(2, 1),
+                        value=padded_v.transpose(2, 1),
+                        block_mask=block_mask
+                    )[:, :, :-padded_length].transpose(2, 1)
+
+                x = _time_attention("self", _flex_call)
 
             else:
                 roped_query = rope_apply(q, grid_sizes, freqs).type_as(v)
@@ -195,12 +215,15 @@ class CausalWanSelfAttention(nn.Module):
                     dim=1
                 )
 
-                x = flex_attention(
-                    query=padded_roped_query.transpose(2, 1),
-                    key=padded_roped_key.transpose(2, 1),
-                    value=padded_v.transpose(2, 1),
-                    block_mask=block_mask
-                )[:, :, :-padded_length].transpose(2, 1)
+                def _flex_call():
+                    return flex_attention(
+                        query=padded_roped_query.transpose(2, 1),
+                        key=padded_roped_key.transpose(2, 1),
+                        value=padded_v.transpose(2, 1),
+                        block_mask=block_mask
+                    )[:, :, :-padded_length].transpose(2, 1)
+
+                x = _time_attention("self", _flex_call)
         else:
             frame_seqlen = math.prod(grid_sizes[0][1:]).item()
             current_start_frame = current_start // frame_seqlen
@@ -211,6 +234,7 @@ class CausalWanSelfAttention(nn.Module):
 
             current_end = current_start + roped_query.shape[1]
             sink_tokens = self.sink_size * frame_seqlen
+            kv_prepare_start = time.perf_counter() if profiling_state is not None else None
             # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
             kv_cache_size = kv_cache["k"].shape[1]
             num_new_tokens = roped_query.shape[1]
@@ -223,10 +247,11 @@ class CausalWanSelfAttention(nn.Module):
             #     print(f"kv_cache['global_end_index'] = {kv_cache['global_end_index']}")
             #     print(f"kv_cache['local_end_index'] = {kv_cache['local_end_index']}")
             #     print(f"num_new_tokens = {num_new_tokens}")
+
+            # Compute cache update parameters without modifying kv_cache directly
             global_end_index = kv_cache["global_end_index"]
             local_end_index  = kv_cache["local_end_index"]
 
-            # Compute cache update parameters without modifying kv_cache directly
             cache_update_info = None
             is_recompute = current_end <= global_end_index and current_start > 0
             if self.local_attn_size != -1 and (current_end > global_end_index) and (
@@ -313,6 +338,13 @@ class CausalWanSelfAttention(nn.Module):
                     "is_recompute": is_recompute
                 }
 
+            if kv_prepare_start is not None:
+                append_timing(
+                    profiling_state["kv_prepare_ms"],
+                    (time.perf_counter() - kv_prepare_start) * 1000.0
+                )
+                profiling_state["kv_cache_op_counts"]["prepare"] += 1
+
             # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
             #     print(f"local_start_index: {local_start_index}, local_end_index: {local_end_index}")
 
@@ -324,6 +356,7 @@ class CausalWanSelfAttention(nn.Module):
                 v_sink = temp_v[:, :sink_tokens]
                 # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
                 #     print(f"local_budget: {local_budget}")
+                sink_concat_start = time.perf_counter() if profiling_state is not None else None
                 if local_budget > 0:
                     local_start_for_window = max(sink_tokens, local_end_index - local_budget)
                     k_local = temp_k[:, local_start_for_window:local_end_index]
@@ -333,17 +366,29 @@ class CausalWanSelfAttention(nn.Module):
                 else:
                     k_cat = k_sink
                     v_cat = v_sink
-                x = attention(
-                    roped_query,
-                    k_cat,
-                    v_cat
+                if sink_concat_start is not None:
+                    append_timing(
+                        profiling_state["kv_sink_concat_ms"],
+                        (time.perf_counter() - sink_concat_start) * 1000.0
+                    )
+                    profiling_state["kv_cache_op_counts"]["sink_concat"] += 1
+                x = _time_attention(
+                    "self",
+                    lambda: attention(
+                        roped_query,
+                        k_cat,
+                        v_cat
+                    )
                 )
             else:
                 window_start = max(0, local_end_index - self.max_attention_size)
-                x = attention(
-                    roped_query,
-                    temp_k[:, window_start:local_end_index],
-                    temp_v[:, window_start:local_end_index]
+                x = _time_attention(
+                    "self",
+                    lambda: attention(
+                        roped_query,
+                        temp_k[:, window_start:local_end_index],
+                        temp_v[:, window_start:local_end_index]
+                    )
                 )
 
         # output
@@ -425,6 +470,21 @@ class CausalWanAttentionBlock(nn.Module):
         # with amp.autocast(dtype=torch.float32):
         e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
         # assert e[0].dtype == torch.float32
+        profiling_state = getattr(self, "_profiling_state", None)
+
+        def _time_cross_attention(fn):
+            if profiling_state is None:
+                return fn()
+            start_evt = torch.cuda.Event(enable_timing=True)
+            end_evt = torch.cuda.Event(enable_timing=True)
+            start_evt.record()
+            result = fn()
+            end_evt.record()
+            torch.cuda.synchronize()
+            duration_ms = start_evt.elapsed_time(end_evt)
+            append_timing(profiling_state["attention_kernel_ms"]["cross"], duration_ms)
+            profiling_state["attention_kernel_counts"]["cross"] += 1
+            return result
 
         # self-attention
         self_attn_result = self.self_attn(
@@ -443,8 +503,15 @@ class CausalWanAttentionBlock(nn.Module):
 
         # cross-attention & ffn function
         # def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None):
-        x = x + self.cross_attn(self.norm3(x), context,
+        if profiling_state is not None:
+            cross_out = _time_cross_attention(
+                lambda: self.cross_attn(self.norm3(x), context,
+                                        context_lens, crossattn_cache=crossattn_cache)
+            )
+        else:
+            cross_out = self.cross_attn(self.norm3(x), context,
                                 context_lens, crossattn_cache=crossattn_cache)
+        x = x + cross_out
         y = self.ffn(
             (self.norm2(x).unflatten(dim=1, sizes=(num_frames,
                 frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2)
@@ -839,7 +906,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             kv_cache: List of cache dictionaries for each block
             cache_update_infos: List of (block_index, cache_update_info) tuples
         """
+        profiling_state = getattr(self, "_profiling_state", None)
         for block_index, (current_end, local_end_index, update_info) in cache_update_infos:
+            apply_start = time.perf_counter() if profiling_state is not None else None
             if update_info is not None:
                 cache = kv_cache[block_index]
                 
@@ -884,7 +953,13 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             is_recompute = False if update_info is None else update_info.get("is_recompute", False)
             if not is_recompute:
                 kv_cache[block_index]["global_end_index"] = current_end
-                kv_cache[block_index]["local_end_index"]  = local_end_index
+                kv_cache[block_index]["local_end_index"] = local_end_index
+            if apply_start is not None:
+                append_timing(
+                    profiling_state["kv_apply_ms"],
+                    (time.perf_counter() - apply_start) * 1000.0
+                )
+                profiling_state["kv_cache_op_counts"]["apply"] += 1
 
     def _forward_inference(
         self,
@@ -941,10 +1016,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # print("patch embedding done")
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
-        x = [u.flatten(2).transpose(1, 2).contiguous() for u in x]
+        x = [u.flatten(2).transpose(1, 2) for u in x]
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
         assert seq_lens.max() <= seq_len
-        x = torch.cat(x).contiguous()
+        x = torch.cat(x)
         """
         torch.cat([
             torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],

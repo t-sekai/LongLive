@@ -25,10 +25,15 @@ class CausalInferencePipeline(torch.nn.Module):
         # Step 1: Initialize all models
         if DEBUG:
             print(f"args.model_kwargs: {args.model_kwargs}")
+        use_torch_compile = getattr(args, "use_torch_compile", False)
+        use_cuda_graphs = getattr(args, "use_cuda_graphs", False)
         self.generator = WanDiffusionWrapper(
-            **getattr(args, "model_kwargs", {}), is_causal=True) if generator is None else generator
+            **getattr(args, "model_kwargs", {}), is_causal=True,
+            can_profile=(not use_torch_compile) and (not use_cuda_graphs)) if generator is None else generator
         self.text_encoder = WanTextEncoder() if text_encoder is None else text_encoder
-        self.vae = WanVAEWrapper() if vae is None else vae
+        self.vae = WanVAEWrapper(
+            use_torch_compile=getattr(args, "use_torch_compile", False),
+            compile_mode=getattr(args, "vae_compile_mode", "default")) if vae is None else vae
 
         # Step 2: Initialize all causal hyperparmeters
         self.scheduler = self.generator.get_scheduler()
@@ -62,6 +67,10 @@ class CausalInferencePipeline(torch.nn.Module):
         """
         Attach or clear profiling state on generator/VAE modules so they can emit fine-grained metrics.
         """
+        use_torch_compile = getattr(self.args, "use_torch_compile", False)
+        use_cuda_graphs = getattr(self.args, "use_cuda_graphs", False)
+        if use_torch_compile or use_cuda_graphs:
+            return # profiling not supported with torch.compile
         self._profiling_state = profiling_state
         modules_to_visit = []
         if hasattr(self.generator, "modules"):
@@ -320,8 +329,8 @@ class CausalInferencePipeline(torch.nn.Module):
             kv_cache1.append({
                 "k": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
-                "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
+                "global_end_index": 0, #torch.tensor([0], dtype=torch.long, device=device),
+                "local_end_index": 0, #torch.tensor([0], dtype=torch.long, device=device)
             })
 
         self.kv_cache1 = kv_cache1  # always store the clean cache

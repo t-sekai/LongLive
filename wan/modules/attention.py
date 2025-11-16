@@ -64,24 +64,58 @@ def flash_attention(
     assert dtype in half_dtypes
     assert q.device.type == 'cuda' and q.size(-1) <= 256
 
-    # params
+    # original shapes
     b, lq, lk, out_dtype = q.size(0), q.size(1), k.size(1), q.dtype
+
+    if not FLASH_ATTN_2_AVAILABLE and not FLASH_ATTN_3_AVAILABLE:
+        # In your current runs, context_lens is None so this is fine.
+        if q_lens is not None or k_lens is not None:
+            raise RuntimeError(
+                "SDPA fallback in flash_attention does not support q_lens/k_lens; "
+                f"got q_lens={q_lens is not None}, k_lens={k_lens is not None}"
+            )
+
+        # SDPA expects [B, H, L, D]
+        q_sdpa = q.to(dtype).permute(0, 2, 1, 3)  # [B, H, Lq, D]
+        k_sdpa = k.to(dtype).permute(0, 2, 1, 3)  # [B, H, Lk, D]
+        v_sdpa = v.to(dtype).permute(0, 2, 1, 3)  # [B, H, Lk, D]
+
+        if q_scale is not None:
+            q_sdpa = q_sdpa * q_scale
+
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q_sdpa,
+            k_sdpa,
+            v_sdpa,
+            attn_mask=None,
+            is_causal=causal,
+            dropout_p=dropout_p,
+        )
+        # back to [B, Lq, H, D]
+        out = out.permute(0, 2, 1, 3).contiguous()
+        return out.type(out_dtype)
+
     total_queries = None
 
     def half(x):
         return x if x.dtype in half_dtypes else x.to(dtype)
 
-    # preprocess query
+     # preprocess query
     if q_lens is None:
         q = half(q.flatten(0, 1))
         num_heads = q.size(1)
-        q_lens = torch.tensor(
-            [lq] * b, dtype=torch.int32).to(
-                device=q.device, non_blocking=True)
+        q_lens = torch.full(
+            (b,),
+            lq,
+            dtype=torch.int32,
+            device=q.device,
+        )
     else:
         q = half(torch.cat([u[:v] for u, v in zip(q, q_lens)]))
         num_heads = q.size(1)
-    total_queries = int(q_lens.sum().item())
+
+    # Avoid .item() on CUDA during graph capture: just read the batch dimension
+    total_queries = q.size(0)
 
     # preprocess key, value
     if k_lens is None:

@@ -10,18 +10,34 @@ from einops import repeat
 from .attention import flash_attention
 
 __all__ = ['WanModel']
-
+_sinusoidal_cache = {}
 
 def sinusoidal_embedding_1d(dim, position):
     # preprocess
     assert dim % 2 == 0
-    half = dim // 2
-    position = position.type(torch.float64)
+    device = position.device
+    key = (dim, device)
+    # Precompute the inverse frequencies ONCE per (dim, device).
+    # This may allocate tensors, so it should run in eager/warmup,
+    # but will be skipped during CUDA graph replay.
+    if key not in _sinusoidal_cache:
+        half = dim // 2
+        # 10000.0 in float32 to avoid implicit dtype promotion.
+        base = torch.tensor(10000.0, dtype=torch.float32, device=device)
+        # [half] tensor of inverse frequencies
+        inv_freq = torch.pow(
+            base,
+            -torch.arange(half, dtype=torch.float32, device=device) / half,
+        )
+        _sinusoidal_cache[key] = inv_freq
 
-    # calculation
-    sinusoid = torch.outer(
-        position, torch.pow(10000, -torch.arange(half).to(position).div(half)))
-    x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
+    inv_freq = _sinusoidal_cache[key]  # [half]
+
+    # Now all ops are graph-safe: only arithmetic + sin/cos/concat.
+    pos = position.to(dtype=torch.float32).reshape(-1, 1)  # [B, 1]
+    sinusoid = pos * inv_freq.view(1, -1)                  # [B, half]
+
+    x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)  # [B, dim]
     return x
 
 

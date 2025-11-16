@@ -30,6 +30,9 @@ from pipeline.interactive_causal_inference import (
 )
 from utils.dataset import MultiTextDataset
 
+# import torch._dynamo as dynamo
+# dynamo.config.capture_scalar_outputs = True
+
 
 # ----------------------------- Argument parsing -----------------------------
 parser = argparse.ArgumentParser("Interactive causal inference")
@@ -139,6 +142,13 @@ if low_memory:
     DynamicSwapInstaller.install_model(pipeline.text_encoder, device=device)
 pipeline.generator.to(device=device)
 pipeline.vae.to(device=device)
+
+# Torch compile models if specified
+use_torch_compile = getattr(config, "use_torch_compile", False)
+compile_mode = getattr(config, "compile_mode", "reduce-overhead")
+if use_torch_compile:
+    print(f"[Rank {local_rank}] Compiling generator.model with mode='{compile_mode}'")
+    pipeline.generator.enable_torch_compile(mode=compile_mode)
 
 # ----------------------------- Build dataset -----------------------------
 # Parse switch_frame_indices

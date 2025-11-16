@@ -13,6 +13,7 @@ from wan.modules.model import WanModel, RegisterTokens, GanAttentionBlock
 from wan.modules.vae import _video_vae
 from wan.modules.t5 import umt5_xxl
 from wan.modules.causal_model import CausalWanModel
+from wan.modules.causal_model_profiled import CausalWanModel as CausalWanModelProfiled
 
 
 class WanTextEncoder(torch.nn.Module):
@@ -60,7 +61,7 @@ class WanTextEncoder(torch.nn.Module):
 
 
 class WanVAEWrapper(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, use_torch_compile: bool = False, compile_mode: str = "default"):
         super().__init__()
         mean = [
             -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
@@ -78,6 +79,11 @@ class WanVAEWrapper(torch.nn.Module):
             pretrained_path="wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
             z_dim=16,
         ).eval().requires_grad_(False)
+
+        self.use_torch_compile = use_torch_compile
+        self.compile_mode = compile_mode
+        self._compiled_decode = None
+        self._compiled_cached_decode = None
 
     def encode_to_latent(self, pixel: torch.Tensor) -> torch.Tensor:
         # pixel: [batch_size, num_channels, num_frames, height, width]
@@ -118,6 +124,24 @@ class WanVAEWrapper(torch.nn.Module):
         device, dtype = latent.device, latent.dtype
         scale = [self.mean.to(device=device, dtype=dtype),
                  1.0 / self.std.to(device=device, dtype=dtype)]
+
+        if self.use_torch_compile and latent.is_cuda:
+            if self._compiled_decode is None:
+                # bind 'self.model' through closure; this is fine
+                self._compiled_decode = torch.compile(
+                    self.model.decode,
+                    mode=self.compile_mode,  # "default" or "reduce-overhead"
+                    fullgraph=False,
+                    dynamic=False,
+                )
+            if self._compiled_cached_decode is None:
+                self._compiled_cached_decode = torch.compile(
+                    self.model.cached_decode,
+                    mode=self.compile_mode,
+                    fullgraph=False,
+                    dynamic=False,
+                )
+
         profiling_state = getattr(self, "_profiling_state", None)
         use_cuda_timing = profiling_state is not None and latent.is_cuda
         decode_start_evt = torch.cuda.Event(enable_timing=True) if use_cuda_timing else None
@@ -127,9 +151,15 @@ class WanVAEWrapper(torch.nn.Module):
             decode_start_evt.record()
 
         if use_cache:
-            decode_function = self.model.cached_decode
+            if self.use_torch_compile and latent.is_cuda:
+                decode_function = self._compiled_cached_decode
+            else:
+                decode_function = self.model.cached_decode
         else:
-            decode_function = self.model.decode
+            if self.use_torch_compile and latent.is_cuda:
+                decode_function = self._compiled_decode
+            else:
+                decode_function = self.model.decode
 
         output = []
         for u in zs:
@@ -156,13 +186,18 @@ class WanDiffusionWrapper(torch.nn.Module):
             timestep_shift=8.0,
             is_causal=False,
             local_attn_size=-1,
-            sink_size=0
+            sink_size=0,
+            can_profile=False
     ):
         super().__init__()
 
         if is_causal:
-            self.model = CausalWanModel.from_pretrained(
-                f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
+            if can_profile:
+                self.model = CausalWanModelProfiled.from_pretrained(
+                    f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
+            else:
+                self.model = CausalWanModel.from_pretrained(
+                    f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
         else:
             self.model = WanModel.from_pretrained(f"wan_models/{model_name}/")
         self.model.eval()
@@ -175,9 +210,23 @@ class WanDiffusionWrapper(torch.nn.Module):
         )
         self.scheduler.set_timesteps(1000, training=True)
 
+        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        # keep them in high precision for FM math
+        self.scheduler.sigmas = self.scheduler.sigmas.to(device=device, dtype=torch.float64)
+        self.scheduler.timesteps = self.scheduler.timesteps.to(device=device, dtype=torch.float64)
+
         # self.seq_len = 1560 * local_attn_size if local_attn_size != -1 else 32760 # [1, 21, 16, 60, 104]
         self.seq_len = 1560 * local_attn_size if local_attn_size > 21 else 32760 # [1, 21, 16, 60, 104]
         self.post_init()
+    
+    def enable_torch_compile(self, mode="reduce-overhead") -> None:
+        if not isinstance(self.model, torch._dynamo.OptimizedModule):
+            self.model = torch.compile(
+                self.model,
+                mode=mode,
+                fullgraph=False,
+                dynamic=False,
+            )
 
     def enable_gradient_checkpointing(self) -> None:
         self.model.enable_gradient_checkpointing()
@@ -218,14 +267,18 @@ class WanDiffusionWrapper(torch.nn.Module):
         """
         # use higher precision for calculations
         original_dtype = flow_pred.dtype
-        flow_pred, xt, sigmas, timesteps = map(
-            lambda x: x.double().to(flow_pred.device), [flow_pred, xt,
-                                                        self.scheduler.sigmas,
-                                                        self.scheduler.timesteps]
-        )
+        # keep everything on the existing device; just go to float64 for math
+        device = flow_pred.device
+        flow_pred = flow_pred.to(torch.float64)
+        xt = xt.to(torch.float64)
+        
+        # sigmas/timesteps are already float64 + on the right device from __init__
+        sigmas = self.scheduler.sigmas  # [num_steps]
+        timesteps = self.scheduler.timesteps  # [num_steps]
 
         timestep_id = torch.argmin(
-            (timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
+            (timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1
+        )
         sigma_t = sigmas[timestep_id].reshape(-1, 1, 1, 1)
         x0_pred = xt - sigma_t * flow_pred
         return x0_pred.to(original_dtype)
@@ -242,13 +295,15 @@ class WanDiffusionWrapper(torch.nn.Module):
         """
         # use higher precision for calculations
         original_dtype = x0_pred.dtype
-        x0_pred, xt, sigmas, timesteps = map(
-            lambda x: x.double().to(x0_pred.device), [x0_pred, xt,
-                                                      scheduler.sigmas,
-                                                      scheduler.timesteps]
-        )
+        x0_pred = x0_pred.to(torch.float64)
+        xt = xt.to(torch.float64)
+
+        sigmas = scheduler.sigmas
+        timesteps = scheduler.timesteps
+
         timestep_id = torch.argmin(
-            (timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
+            (timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1
+        )
         sigma_t = sigmas[timestep_id].reshape(-1, 1, 1, 1)
         flow_pred = (xt - x0_pred) / sigma_t
         return flow_pred.to(original_dtype)
