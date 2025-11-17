@@ -204,14 +204,15 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     )
 
     enable_profiling = False if getattr(config, "profile", None) is None else config.profile
+    enable_detailed_profiling = False if getattr(config, "detailed_profile", None) is None else config.detailed_profile
     profiling_output_dir = getattr(config, "profile_output_dir", None)
-
     video = pipeline.inference(
         noise=sampled_noise,
         text_prompts_list=prompts_list,
         switch_frame_indices=switch_frame_indices,
         return_latents=False,
         profile=enable_profiling,
+        detailed_profile=enable_detailed_profiling,
         profile_output_dir=profiling_output_dir,
     )
 

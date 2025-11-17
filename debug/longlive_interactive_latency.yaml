@@ -38,6 +38,7 @@ adapter:
   verbose: false              # Whether to print all target module names
 
 profile: true
+detailed_profile: false
 profile_output_dir: moonlake/results/tuning
 use_torch_compile: true
 compile_mode: default

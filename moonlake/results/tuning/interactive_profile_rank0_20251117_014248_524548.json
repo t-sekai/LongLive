@@ -1,0 +1,11 @@
+{
+  "init_time_ms": 12.13315200805664,
+  "init_percentage": 0.011371768741741612,
+  "diffusion_time_ms": 80749.5,
+  "diffusion_percentage": 75.68228267489927,
+  "vae_time_ms": 25933.748046875,
+  "vae_percentage": 24.30634555635899,
+  "total_time_ms": 106695.38119888306,
+  "rank": 0,
+  "timestamp": "20251117_014248_524548"
+}

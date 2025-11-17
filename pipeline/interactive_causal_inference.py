@@ -151,6 +151,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         return_latents: bool = False,
         low_memory: bool = False,
         profile: bool = False,
+        detailed_profile: bool = False,
         profile_output_dir: Optional[str] = None,
     ):
         """Generate a video and switch prompts at specified frame indices.
@@ -208,21 +209,22 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             diffusion_end = torch.cuda.Event(enable_timing=True)
             vae_start = torch.cuda.Event(enable_timing=True)
             vae_end = torch.cuda.Event(enable_timing=True)
-            block_times = []
-            block_start = torch.cuda.Event(enable_timing=True)
-            block_end = torch.cuda.Event(enable_timing=True)
-            recache_times = []
-            recache_start = torch.cuda.Event(enable_timing=True)
-            recache_end = torch.cuda.Event(enable_timing=True)
-            denoise_step_start = torch.cuda.Event(enable_timing=True)
-            denoise_step_end = torch.cuda.Event(enable_timing=True)
-            add_noise_start = torch.cuda.Event(enable_timing=True)
-            add_noise_end = torch.cuda.Event(enable_timing=True)
+            if detailed_profile:
+                block_times = []
+                block_start = torch.cuda.Event(enable_timing=True)
+                block_end = torch.cuda.Event(enable_timing=True)
+                recache_times = []
+                recache_start = torch.cuda.Event(enable_timing=True)
+                recache_end = torch.cuda.Event(enable_timing=True)
+                denoise_step_start = torch.cuda.Event(enable_timing=True)
+                denoise_step_end = torch.cuda.Event(enable_timing=True)
+                add_noise_start = torch.cuda.Event(enable_timing=True)
+                add_noise_end = torch.cuda.Event(enable_timing=True)
 
-            frame_latencies_ms = []         # steady-state inter-frame
-            prompt_switch_latencies_ms = [] # per prompt switch
-            measuring_prompt_switch = False
-            prompt_switch_start = torch.cuda.Event(enable_timing=True)
+                frame_latencies_ms = []         # steady-state inter-frame
+                prompt_switch_latencies_ms = [] # per prompt switch
+                measuring_prompt_switch = False
+                prompt_switch_start = torch.cuda.Event(enable_timing=True)
             init_start.record()
         else:
             if self._profiling_state is not None:
@@ -286,7 +288,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
 
         for current_num_frames in all_num_frames:
             if next_switch_pos is not None and current_start_frame >= next_switch_pos:
-                if profile:
+                if profile and detailed_profile:
                     prompt_switch_start.record()
                     recache_start.record()
                 segment_idx += 1
@@ -306,7 +308,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                     self._static_timestep = None
                     self._static_cond = None
                     self._static_out_pred = None
-                if profile:
+                if profile and detailed_profile:
                     recache_end.record()
                     record_cuda_sync("recache_switch")
                     recache_elapsed = recache_start.elapsed_time(recache_end)
@@ -317,7 +319,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 print(f"text_prompts_list[segment_idx]: {text_prompts_list[segment_idx]}")
             cond_in_use = cond_list[segment_idx]
 
-            if profile:
+            if profile and detailed_profile:
                 block_start.record()
 
             noisy_input = noise[
@@ -353,7 +355,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                         cond_in_use=cond_in_use,
                         current_start_frame=current_start_frame,
                     )
-                if profile:
+                if profile and detailed_profile:
                     denoise_step_start.record()
                 if use_graph and self._denoise_graph is not None:
                     # Copy inputs into static buffers
@@ -375,7 +377,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                         crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length,
                     )
-                if profile:
+                if profile and detailed_profile:
                     denoise_step_end.record()
                     denoise_step_end.synchronize()
                     append_timing(
@@ -383,7 +385,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                         denoise_step_start.elapsed_time(denoise_step_end)
                     )
                 if index < len(self.denoising_step_list) - 1:
-                    if profile:
+                    if profile and detailed_profile:
                         add_noise_start.record()
                     flat_step = flat_step_tensors[index]
                     noisy_input = self.scheduler.add_noise(
@@ -394,7 +396,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                             [batch_size * current_num_frames], device=noise.device, dtype=torch.long
                         ),
                     ).view_as(denoised_pred)
-                    if profile:
+                    if profile and detailed_profile:
                         add_noise_end.record()
                         add_noise_end.synchronize()
                         append_timing(
@@ -426,7 +428,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 current_start=current_start_frame * self.frame_seq_length,
             )
 
-            if profile:
+            if profile and detailed_profile:
                 block_end.record()
                 record_cuda_sync("block_end")
                 block_elapsed = block_start.elapsed_time(block_end)
@@ -453,7 +455,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
 
         # Standard decoding
         decode_transfer_start = None
-        if (profile and profiling_state is not None and output.device != noise.device):
+        if (profile and detailed_profile and profiling_state is not None and output.device != noise.device):
             decode_transfer_start = time.perf_counter()
         decode_input = output.to(noise.device)
         if decode_transfer_start is not None:
@@ -464,7 +466,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             )
         video = self.vae.decode_to_pixel(decode_input, use_cache=False)
         video = (video * 0.5 + 0.5).clamp(0, 1)
-        if profile and profiling_state is not None:
+        if profile and detailed_profile and profiling_state is not None:
             quant_start = time.perf_counter()
             quantized_video = (video * 255.0).round().clamp_(0, 255).to(torch.uint8)
             append_timing(
@@ -487,159 +489,172 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             init_pct = 100 * init_time / total_time if total_time else 0.0
             diffusion_pct = 100 * diffusion_time / total_time if total_time else 0.0
             vae_pct = 100 * vae_time / total_time if total_time else 0.0
-            block_stats = []
-            for i, block_time in enumerate(block_times):
-                percent = 100 * block_time / diffusion_time if diffusion_time else 0.0
-                block_stats.append({
-                    "block_index": i,
-                    "time_ms": block_time,
-                    "percent_of_diffusion": percent
-                })
-            recache_stats = []
-            for i, recache_time in enumerate(recache_times):
-                percent = 100 * recache_time / diffusion_time if diffusion_time else 0.0
-                recache_stats.append({
-                    "recache_index": i,
-                    "time_ms": recache_time,
-                    "percent_of_diffusion": percent
-                })
-            # Steady-state inter-frame latency
-            inter_frame_mean = float(np.mean(frame_latencies_ms)) if frame_latencies_ms else 0.0
-            inter_frame_p95  = float(np.percentile(frame_latencies_ms, 95)) if frame_latencies_ms else 0.0
-            inter_frame_max  = float(np.max(frame_latencies_ms)) if frame_latencies_ms else 0.0
-            # Prompt-switch latency
-            prompt_switch_mean = float(np.mean(prompt_switch_latencies_ms)) if prompt_switch_latencies_ms else 0.0
-            prompt_switch_max  = float(np.max(prompt_switch_latencies_ms)) if prompt_switch_latencies_ms else 0.0
+            if detailed_profile:
+                block_stats = []
+                for i, block_time in enumerate(block_times):
+                    percent = 100 * block_time / diffusion_time if diffusion_time else 0.0
+                    block_stats.append({
+                        "block_index": i,
+                        "time_ms": block_time,
+                        "percent_of_diffusion": percent
+                    })
+                recache_stats = []
+                for i, recache_time in enumerate(recache_times):
+                    percent = 100 * recache_time / diffusion_time if diffusion_time else 0.0
+                    recache_stats.append({
+                        "recache_index": i,
+                        "time_ms": recache_time,
+                        "percent_of_diffusion": percent
+                    })
+                # Steady-state inter-frame latency
+                inter_frame_mean = float(np.mean(frame_latencies_ms)) if frame_latencies_ms else 0.0
+                inter_frame_p95  = float(np.percentile(frame_latencies_ms, 95)) if frame_latencies_ms else 0.0
+                inter_frame_max  = float(np.max(frame_latencies_ms)) if frame_latencies_ms else 0.0
+                # Prompt-switch latency
+                prompt_switch_mean = float(np.mean(prompt_switch_latencies_ms)) if prompt_switch_latencies_ms else 0.0
+                prompt_switch_max  = float(np.max(prompt_switch_latencies_ms)) if prompt_switch_latencies_ms else 0.0
 
-            def _basic_stats(samples):
-                if not samples:
+                def _basic_stats(samples):
+                    if not samples:
+                        return {
+                            "count": 0,
+                            "total_ms": 0.0,
+                            "mean_ms": 0.0,
+                            "p95_ms": 0.0,
+                            "max_ms": 0.0,
+                        }
+                    arr = np.array(samples, dtype=np.float64)
                     return {
-                        "count": 0,
-                        "total_ms": 0.0,
-                        "mean_ms": 0.0,
-                        "p95_ms": 0.0,
-                        "max_ms": 0.0,
+                        "count": int(arr.size),
+                        "total_ms": float(arr.sum()),
+                        "mean_ms": float(arr.mean()),
+                        "p95_ms": float(np.percentile(arr, 95)),
+                        "max_ms": float(arr.max()),
                     }
-                arr = np.array(samples, dtype=np.float64)
-                return {
-                    "count": int(arr.size),
-                    "total_ms": float(arr.sum()),
-                    "mean_ms": float(arr.mean()),
-                    "p95_ms": float(np.percentile(arr, 95)),
-                    "max_ms": float(arr.max()),
-                }
 
-            def _dict_stats(bucket):
-                return {label: _basic_stats(vals) for label, vals in bucket.items()}
+                def _dict_stats(bucket):
+                    return {label: _basic_stats(vals) for label, vals in bucket.items()}
 
-            denoising_step_stats = []
-            if profiling_state is not None:
-                for step_idx in sorted(profiling_state["denoising_step_ms"].keys()):
-                    stats = _basic_stats(profiling_state["denoising_step_ms"][step_idx])
-                    stats["step_index"] = int(step_idx)
-                    denoising_step_stats.append(stats)
+                denoising_step_stats = []
+                if profiling_state is not None:
+                    for step_idx in sorted(profiling_state["denoising_step_ms"].keys()):
+                        stats = _basic_stats(profiling_state["denoising_step_ms"][step_idx])
+                        stats["step_index"] = int(step_idx)
+                        denoising_step_stats.append(stats)
 
-            add_noise_step_stats = []
-            if profiling_state is not None:
-                for step_idx in sorted(profiling_state["add_noise_step_ms"].keys()):
-                    stats = _basic_stats(profiling_state["add_noise_step_ms"][step_idx])
-                    stats["step_index"] = int(step_idx)
-                    add_noise_step_stats.append(stats)
+                add_noise_step_stats = []
+                if profiling_state is not None:
+                    for step_idx in sorted(profiling_state["add_noise_step_ms"].keys()):
+                        stats = _basic_stats(profiling_state["add_noise_step_ms"][step_idx])
+                        stats["step_index"] = int(step_idx)
+                        add_noise_step_stats.append(stats)
 
-            attention_kernel_stats = {}
-            if profiling_state is not None:
-                attention_kernel_stats = {
-                    kind: _basic_stats(samples)
-                    for kind, samples in profiling_state["attention_kernel_ms"].items()
-                }
-                attention_kernel_stats["counts"] = dict(profiling_state["attention_kernel_counts"])
+                attention_kernel_stats = {}
+                if profiling_state is not None:
+                    attention_kernel_stats = {
+                        kind: _basic_stats(samples)
+                        for kind, samples in profiling_state["attention_kernel_ms"].items()
+                    }
+                    attention_kernel_stats["counts"] = dict(profiling_state["attention_kernel_counts"])
 
-            kv_operation_stats = {}
-            if profiling_state is not None:
-                kv_operation_stats = {
-                    "prepare": _basic_stats(profiling_state["kv_prepare_ms"]),
-                    "apply": _basic_stats(profiling_state["kv_apply_ms"]),
-                    "sink_concat": _basic_stats(profiling_state["kv_sink_concat_ms"]),
-                    "counts": dict(profiling_state["kv_cache_op_counts"]),
-                }
+                kv_operation_stats = {}
+                if profiling_state is not None:
+                    kv_operation_stats = {
+                        "prepare": _basic_stats(profiling_state["kv_prepare_ms"]),
+                        "apply": _basic_stats(profiling_state["kv_apply_ms"]),
+                        "sink_concat": _basic_stats(profiling_state["kv_sink_concat_ms"]),
+                        "counts": dict(profiling_state["kv_cache_op_counts"]),
+                    }
 
-            kv_recache_summary = {}
-            if profiling_state is not None:
-                kv_recache_summary = {
-                    label: _basic_stats(entries)
-                    for label, entries in profiling_state["kv_recache_ms"].items()
-                }
+                kv_recache_summary = {}
+                if profiling_state is not None:
+                    kv_recache_summary = {
+                        label: _basic_stats(entries)
+                        for label, entries in profiling_state["kv_recache_ms"].items()
+                    }
 
-            quantization_stats = {}
-            if profiling_state is not None:
-                quantization_stats = {
-                    "quantize": _basic_stats(profiling_state["quantize_ms"]),
-                    "dequantize": _basic_stats(profiling_state["dequantize_ms"]),
-                }
+                quantization_stats = {}
+                if profiling_state is not None:
+                    quantization_stats = {
+                        "quantize": _basic_stats(profiling_state["quantize_ms"]),
+                        "dequantize": _basic_stats(profiling_state["dequantize_ms"]),
+                    }
 
-            vae_kernel_stats = {}
-            if profiling_state is not None:
-                vae_kernel_stats = {
-                    "decode": _basic_stats(profiling_state["vae_decode_ms"]),
-                    "encode": _basic_stats(profiling_state["vae_encode_ms"]),
-                }
+                vae_kernel_stats = {}
+                if profiling_state is not None:
+                    vae_kernel_stats = {
+                        "decode": _basic_stats(profiling_state["vae_decode_ms"]),
+                        "encode": _basic_stats(profiling_state["vae_encode_ms"]),
+                    }
 
-            device_transfer_stats = _dict_stats(profiling_state["device_transfer_ms"]) if profiling_state is not None else {}
-            host_sync_stats = _dict_stats(profiling_state["host_sync_ms"]) if profiling_state is not None else {}
+                device_transfer_stats = _dict_stats(profiling_state["device_transfer_ms"]) if profiling_state is not None else {}
+                host_sync_stats = _dict_stats(profiling_state["host_sync_ms"]) if profiling_state is not None else {}
 
             # Prepare profiling summary
-            profiling_summary = {
-                "init_time_ms": init_time,
-                "init_percentage": init_pct,
-                "diffusion_time_ms": diffusion_time,
-                "diffusion_percentage": diffusion_pct,
-                "vae_time_ms": vae_time,
-                "vae_percentage": vae_pct,
-                "total_time_ms": total_time,
-                "block_stats": block_stats,
-                "recache_stats": recache_stats,
-                "batch_size": batch_size,                
-                "num_blocks": len(block_stats),
-                "num_output_frames": num_output_frames,
-                "num_frame_per_block": self.num_frame_per_block,
-                "local_attn_size": self.local_attn_size,
-                "kv_cache_size": kv_cache_size,
-                "device": str(noise.device),
+            if detailed_profile:
+                profiling_summary = {
+                    "init_time_ms": init_time,
+                    "init_percentage": init_pct,
+                    "diffusion_time_ms": diffusion_time,
+                    "diffusion_percentage": diffusion_pct,
+                    "vae_time_ms": vae_time,
+                    "vae_percentage": vae_pct,
+                    "total_time_ms": total_time,
+                    "block_stats": block_stats,
+                    "recache_stats": recache_stats,
+                    "batch_size": batch_size,                
+                    "num_blocks": len(block_stats),
+                    "num_output_frames": num_output_frames,
+                    "num_frame_per_block": self.num_frame_per_block,
+                    "local_attn_size": self.local_attn_size,
+                    "kv_cache_size": kv_cache_size,
+                    "device": str(noise.device),
 
-                "inter_frame_latency_ms_mean": inter_frame_mean,
-                "inter_frame_latency_ms_p95": inter_frame_p95,
-                "inter_frame_latency_ms_max": inter_frame_max,
+                    "inter_frame_latency_ms_mean": inter_frame_mean,
+                    "inter_frame_latency_ms_p95": inter_frame_p95,
+                    "inter_frame_latency_ms_max": inter_frame_max,
 
-                "prompt_switch_latencies_ms": prompt_switch_latencies_ms,
-                "prompt_switch_latency_ms_mean": prompt_switch_mean,
-                "prompt_switch_latency_ms_max": prompt_switch_max,
-                "denoising_step_stats": denoising_step_stats,
-                "add_noise_step_stats": add_noise_step_stats,
-                "attention_kernel_stats": attention_kernel_stats,
-                "kv_operation_stats": kv_operation_stats,
-                "kv_recache_breakdown_ms": kv_recache_summary,
-                "quantization_stats": quantization_stats,
-                "vae_kernel_stats": vae_kernel_stats,
-                "device_transfer_stats": device_transfer_stats,
-                "host_sync_stats": host_sync_stats,
-            }
+                    "prompt_switch_latencies_ms": prompt_switch_latencies_ms,
+                    "prompt_switch_latency_ms_mean": prompt_switch_mean,
+                    "prompt_switch_latency_ms_max": prompt_switch_max,
+                    "denoising_step_stats": denoising_step_stats,
+                    "add_noise_step_stats": add_noise_step_stats,
+                    "attention_kernel_stats": attention_kernel_stats,
+                    "kv_operation_stats": kv_operation_stats,
+                    "kv_recache_breakdown_ms": kv_recache_summary,
+                    "quantization_stats": quantization_stats,
+                    "vae_kernel_stats": vae_kernel_stats,
+                    "device_transfer_stats": device_transfer_stats,
+                    "host_sync_stats": host_sync_stats,
+                }
+            else:
+                profiling_summary = {
+                    "init_time_ms": init_time,
+                    "init_percentage": init_pct,
+                    "diffusion_time_ms": diffusion_time,
+                    "diffusion_percentage": diffusion_pct,
+                    "vae_time_ms": vae_time,
+                    "vae_percentage": vae_pct,
+                    "total_time_ms": total_time
+                }
             self.last_profiling_summary = profiling_summary
 
             print("Profiling results:")
             print(f"  - Initialization/caching time: {init_time:.2f} ms ({init_pct:.2f}%)")
             print(f"  - Diffusion generation time: {diffusion_time:.2f} ms ({diffusion_pct:.2f}%)")
-            for i, block_time in enumerate(block_times):
-                percent = 100 * block_time / diffusion_time if diffusion_time else 0.0
-                print(f"    - Block {i} generation time: {block_time:.2f} ms ({percent:.2f}% of diffusion)")
             print(f"  - VAE decoding time: {vae_time:.2f} ms ({vae_pct:.2f}%)")
             print(f"  - Total time: {total_time:.2f} ms")
 
-            print(f"  - Inter-frame latency (mean): {inter_frame_mean:.2f} ms")
-            print(f"  - Inter-frame latency (p95):  {inter_frame_p95:.2f} ms")
-            print(f"  - Inter-frame latency (max):  {inter_frame_max:.2f} ms")
-            if prompt_switch_latencies_ms:
-                print(f"  - Prompt-switch latency (mean): {prompt_switch_mean:.2f} ms")
-                print(f"  - Prompt-switch latency (max):  {prompt_switch_max:.2f} ms")
+            if detailed_profile:
+                for i, block_time in enumerate(block_times):
+                    percent = 100 * block_time / diffusion_time if diffusion_time else 0.0
+                    print(f"    - Block {i} generation time: {block_time:.2f} ms ({percent:.2f}% of diffusion)")
+                print(f"  - Inter-frame latency (mean): {inter_frame_mean:.2f} ms")
+                print(f"  - Inter-frame latency (p95):  {inter_frame_p95:.2f} ms")
+                print(f"  - Inter-frame latency (max):  {inter_frame_max:.2f} ms")
+                if prompt_switch_latencies_ms:
+                    print(f"  - Prompt-switch latency (mean): {prompt_switch_mean:.2f} ms")
+                    print(f"  - Prompt-switch latency (max):  {prompt_switch_max:.2f} ms")
             if profile_output_dir and profiling_summary is not None:
                 self._write_profiling_results(profile_output_dir, profiling_summary, interactive=True)
 
