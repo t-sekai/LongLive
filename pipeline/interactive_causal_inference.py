@@ -330,7 +330,6 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 base = torch.as_tensor(t, device=noise.device, dtype=torch.int64).view(1, 1)
                 step_tensors.append(base)
             flat_step_tensors = []
-            flat_step_tensors = []
             for i in range(len(self.denoising_step_list) - 1):
                 t_next = torch.as_tensor(self.denoising_step_list[i + 1],
                                         device=noise.device,

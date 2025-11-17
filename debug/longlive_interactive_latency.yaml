@@ -1,14 +1,13 @@
 # Architecture
 denoising_step_list:
-- 1000
-- 750
+- 1000 #- 750
 - 500
 - 250
 warp_denoising_step: true # need to remove - 0 in denoising_step_list if warp_denoising_step is true
 num_frame_per_block: 3
 model_name: Wan2.1-T2V-1.3B
 model_kwargs:
-  local_attn_size: 12
+  local_attn_size: 8
   timestep_shift: 5.0
   sink_size: 3
 
@@ -38,8 +37,9 @@ adapter:
   verbose: false              # Whether to print all target module names
 
 profile: true
-detailed_profile: false
-profile_output_dir: moonlake/results/tuning
+detailed_profile: true
+profile_output_dir: moonlake/results/optimized
 use_torch_compile: true
 compile_mode: default
 use_cuda_graphs: false
+use_bfloat16: true

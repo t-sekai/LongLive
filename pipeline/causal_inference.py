@@ -29,11 +29,13 @@ class CausalInferencePipeline(torch.nn.Module):
         use_cuda_graphs = getattr(args, "use_cuda_graphs", False)
         self.generator = WanDiffusionWrapper(
             **getattr(args, "model_kwargs", {}), is_causal=True,
-            can_profile=(not use_torch_compile) and (not use_cuda_graphs)) if generator is None else generator
+            can_profile=(not use_torch_compile) and (not use_cuda_graphs),
+            use_bfloat16=getattr(args, "use_bfloat16", False)) if generator is None else generator
         self.text_encoder = WanTextEncoder() if text_encoder is None else text_encoder
         self.vae = WanVAEWrapper(
             use_torch_compile=getattr(args, "use_torch_compile", False),
-            compile_mode=getattr(args, "vae_compile_mode", "default")) if vae is None else vae
+            compile_mode=getattr(args, "vae_compile_mode", "default"),
+            use_bfloat16=getattr(args, "use_bfloat16", False)) if vae is None else vae
 
         # Step 2: Initialize all causal hyperparmeters
         self.scheduler = self.generator.get_scheduler()
