@@ -33,6 +33,8 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         super().__init__(args, device, generator=generator, text_encoder=text_encoder, vae=vae)
         self.global_sink = getattr(args, "global_sink", False)
 
+        self._block_mask_cache = {}
+
         # --- CUDA Graph related ---
         self.use_cuda_graphs = getattr(args, "use_cuda_graphs", False)
         self._denoise_graph = None
@@ -84,13 +86,17 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         # prepare blockwise causal mask
         device = frames_to_recache.device
         mask_start = time.perf_counter() if profiling_state is not None else None
-        block_mask = self.generator.model._prepare_blockwise_causal_attn_mask(
-            device=device,
-            num_frames=num_recache_frames,
-            frame_seqlen=self.frame_seq_length,
-            num_frame_per_block=self.num_frame_per_block,
-            local_attn_size=self.local_attn_size
-        )
+        key = (num_recache_frames, self.frame_seq_length,
+            self.num_frame_per_block, self.local_attn_size, device)
+        if key not in self._block_mask_cache:
+            self._block_mask_cache[key] = self.generator.model._prepare_blockwise_causal_attn_mask(
+                device=device,
+                num_frames=num_recache_frames,
+                frame_seqlen=self.frame_seq_length,
+                num_frame_per_block=self.num_frame_per_block,
+                local_attn_size=self.local_attn_size
+            )
+        block_mask = self._block_mask_cache[key]
         if mask_start is not None:
             append_timing(
                 profiling_state["kv_recache_ms"]["cpu"],
@@ -229,8 +235,6 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 append_labeled_timing(
                     profiling_state["host_sync_ms"], label, (time.perf_counter() - start) * 1000.0
                 )
-            else:
-                torch.cuda.synchronize()
 
         # initialize caches
         local_attn_cfg = getattr(self.args.model_kwargs, "local_attn_size", -1)
@@ -245,13 +249,13 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             kv_policy = "global (-1)"
         print(f"kv_cache_size: {kv_cache_size} (policy: {kv_policy}, frame_seq_length: {self.frame_seq_length}, num_output_frames: {num_output_frames})")
 
-        self._initialize_kv_cache(
+        self.kv_cache1 = self._initialize_kv_cache(
             batch_size,
             dtype=noise.dtype,
             device=noise.device,
             kv_cache_size_override=kv_cache_size
         )
-        self._initialize_crossattn_cache(
+        self.crossattn_cache = self._initialize_crossattn_cache(
             batch_size=batch_size,
             dtype=noise.dtype,
             device=noise.device
@@ -319,15 +323,22 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             noisy_input = noise[
                 :, current_start_frame : current_start_frame + current_num_frames
             ]
-
+            step_tensors = []
+            for t in self.denoising_step_list:
+                base = torch.as_tensor(t, device=noise.device, dtype=torch.int64).view(1, 1)
+                step_tensors.append(base)
+            flat_step_tensors = []
+            flat_step_tensors = []
+            for i in range(len(self.denoising_step_list) - 1):
+                t_next = torch.as_tensor(self.denoising_step_list[i + 1],
+                                        device=noise.device,
+                                        dtype=torch.int64)
+                # t_next is scalar tensor; we want its value
+                flat_step = t_next.expand(batch_size * current_num_frames)
+                flat_step_tensors.append(flat_step)
             # ---------------- Spatial denoising loop ----------------
-            for index, current_timestep in enumerate(self.denoising_step_list):
-                timestep = (
-                    torch.ones([batch_size, current_num_frames],
-                    device=noise.device,
-                    dtype=torch.int64)
-                    * current_timestep
-                )
+            for index, base_t in enumerate(step_tensors):
+                timestep = base_t.expand(batch_size, current_num_frames)
                 use_graph = (
                     self.use_cuda_graphs
                     # and not profile              # graphs + profiling don't mix well
@@ -374,15 +385,15 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 if index < len(self.denoising_step_list) - 1:
                     if profile:
                         add_noise_start.record()
-                    next_timestep = self.denoising_step_list[index + 1]
+                    flat_step = flat_step_tensors[index]
                     noisy_input = self.scheduler.add_noise(
-                        denoised_pred.flatten(0, 1),
-                        torch.randn_like(denoised_pred.flatten(0, 1)),
-                        next_timestep
+                        denoised_pred.reshape(batch_size * current_num_frames, *denoised_pred.shape[2:]),
+                        torch.randn_like(denoised_pred.reshape(batch_size * current_num_frames, *denoised_pred.shape[2:])),
+                        flat_step
                         * torch.ones(
                             [batch_size * current_num_frames], device=noise.device, dtype=torch.long
                         ),
-                    ).unflatten(0, denoised_pred.shape[:2])
+                    ).view_as(denoised_pred)
                     if profile:
                         add_noise_end.record()
                         add_noise_end.synchronize()
@@ -691,8 +702,8 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             noisy_image_or_video=self._static_noisy_input,
             conditional_dict=self._static_cond,
             timestep=self._static_timestep,
-            kv_cache=self.kv_cache1,
-            crossattn_cache=self.crossattn_cache,
+            kv_cache=self.kv_cache1, #dummy_kv_cache1,
+            crossattn_cache=self.crossattn_cache, #self.dummy_crossattn_cache,
             current_start=current_start_frame * self.frame_seq_length,
         )
         torch.cuda.synchronize()

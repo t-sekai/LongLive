@@ -158,13 +158,13 @@ class CausalInferencePipeline(torch.nn.Module):
             kv_policy = "global (-1)"
         print(f"kv_cache_size: {kv_cache_size} (policy: {kv_policy}, frame_seq_length: {self.frame_seq_length}, num_output_frames: {num_output_frames})")
 
-        self._initialize_kv_cache(
+        self.kv_cache1 = self._initialize_kv_cache(
             batch_size=batch_size,
             dtype=noise.dtype,
             device=noise.device,
             kv_cache_size_override=kv_cache_size
         )
-        self._initialize_crossattn_cache(
+        self.crossattn_cache = self._initialize_crossattn_cache(
             batch_size=batch_size,
             dtype=noise.dtype,
             device=noise.device
@@ -333,7 +333,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 "local_end_index": 0, #torch.tensor([0], dtype=torch.long, device=device)
             })
 
-        self.kv_cache1 = kv_cache1  # always store the clean cache
+        return kv_cache1  # always store the clean cache
 
     def _initialize_crossattn_cache(self, batch_size, dtype, device):
         """
@@ -347,7 +347,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 "v": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
                 "is_init": False
             })
-        self.crossattn_cache = crossattn_cache
+        return crossattn_cache
 
     def _set_all_modules_max_attention_size(self, local_attn_size_value: int):
         """

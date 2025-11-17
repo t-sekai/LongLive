@@ -32,6 +32,9 @@ from utils.dataset import MultiTextDataset
 
 # import torch._dynamo as dynamo
 # dynamo.config.capture_scalar_outputs = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
 
 
 # ----------------------------- Argument parsing -----------------------------

@@ -38,7 +38,7 @@ adapter:
   verbose: false              # Whether to print all target module names
 
 profile: true
-profile_output_dir: moonlake/results/denoising_step_list
-use_torch_compile: false
+profile_output_dir: moonlake/results/tuning
+use_torch_compile: true
 compile_mode: default
 use_cuda_graphs: false
